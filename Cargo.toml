@@ -4,10 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.0", features = ["rt-multi-thread", "io-util", "time", "io-std"] }
+anyhow = "1.0"
+async-nats = "0.32"  # Add this
+async-trait = "0.1"
+futures-util = "0.3" # Add this
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-anyhow = "1.0"
-async-trait = "0.1"
+tokio = { version = "1.0", features = ["full", "rt-multi-thread", "macros"] } # Make sure features include "macros"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

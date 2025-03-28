@@ -1,12 +1,14 @@
 use anyhow::{Result, Context};
+use async_nats::{Client, ConnectOptions};
 use async_trait::async_trait;
+use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracing::{info, error};
+use tracing_subscriber::EnvFilter;
 
-// --- Types ---
+// --- Types (unchanged) ---
 #[derive(Serialize, Deserialize, Debug)]
 struct JsonRpcRequest {
     jsonrpc: String,
@@ -42,7 +44,7 @@ struct ServerInfo {
 struct ServerCapabilities {
     tools: Option<Value>,
     prompts: Option<Value>,
-    resources: Option<Value,
+    resources: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     notification_options: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -85,44 +87,187 @@ struct PromptArgument {
 enum Content {
     #[serde(rename = "text")]
     Text { text: String },
-    // Add more types (e.g., image, embedded_resource) as needed
+}
+
+// --- Server ---
+pub struct Server {
+    transport: Box<dyn Transport>,
+    tools: Tools,
+    server_name: String,
+    server_version: String,
+    capabilities: ServerCapabilities,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl Server {
+    pub fn new(
+        transport: Box<dyn Transport>,
+        tools: Tools,
+        server_name: String,
+        server_version: String,
+        capabilities: ServerCapabilities,
+        runtime: tokio::runtime::Runtime,
+    ) -> Self {
+        Self {
+            transport,
+            tools,
+            server_name,
+            server_version,
+            capabilities,
+            runtime,
+        }
+    }
+
+    pub async fn run(&self) -> Result<()> {
+        self.transport.run(self).await
+    }
+
+    pub async fn handle_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
+        let id = req.id.clone();
+        let method = req.method.as_str();
+        let params = req.params.unwrap_or(json!({}));
+
+        let result = match method {
+            "initialize" => self.handle_initialize(params).await,
+            "listTools" => self.handle_list_tools(params).await,
+            "callTool" => self.handle_call_tool(params).await,
+            "listResources" => self.handle_list_resources(params).await,
+            "readResource" => self.handle_read_resource(params).await,
+            "listPrompts" => self.handle_list_prompts(params).await,
+            "getPrompt" => self.handle_get_prompt(params).await,
+            _ => Err(anyhow::anyhow!("Method not found: {}", method)),
+        };
+
+        match result {
+            Ok(value) => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id,
+                result: Some(value),
+                error: None,
+            },
+            Err(e) => {
+                error!("Error handling {}: {:?}", method, e);
+                JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32601,
+                        message: e.to_string(),
+                        data: None,
+                    }),
+                }
+            }
+        }
+    }
+
+    async fn handle_initialize(&self, params: Value) -> Result<Value> {
+        let client_info = params.get("clientInfo").and_then(|v| v.as_object());
+        info!("Initializing with client: {:?}", client_info);
+        Ok(json!({
+            "server_name": self.server_name,
+            "server_version": self.server_version,
+            "capabilities": self.capabilities,
+        }))
+    }
+
+    async fn handle_list_tools(&self, _params: Value) -> Result<Value> {
+        Ok(json!({
+            "tools": self.tools.list()
+        }))
+    }
+
+    async fn handle_call_tool(&self, params: Value) -> Result<Value> {
+        let name = params.get("name").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'name' in params"))?;
+        let arguments = params.get("arguments");
+        let content = self.tools.call(name, arguments.cloned()).await?;
+        Ok(json!({
+            "content": content
+        }))
+    }
+
+    async fn handle_list_resources(&self, _params: Value) -> Result<Value> {
+        Ok(json!({
+            "resources": [],
+            "next_cursor": null,
+            "meta": null
+        }))
+    }
+
+    async fn handle_read_resource(&self, params: Value) -> Result<Value> {
+        let uri = params.get("uri").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'uri' in params"))?;
+        Ok(json!(format!("Resource content for {}", uri)))
+    }
+
+    async fn handle_list_prompts(&self, _params: Value) -> Result<Value> {
+        Ok(json!({
+            "prompts": []
+        }))
+    }
+
+    async fn handle_get_prompt(&self, params: Value) -> Result<Value> {
+        let name = params.get("name").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'name' in params"))?;
+        let arguments = params.get("arguments")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'arguments' in params"))?;
+        Ok(json!({
+            "description": format!("Prompt '{}'", name),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": {
+                        "type": "text",
+                        "text": format!("Prompt with args: {:?}", arguments)
+                    }
+                }
+            ]
+        }))
+    }
 }
 
 // --- Transport ---
 #[async_trait]
-trait Transport: Send + Sync + 'static {
-    async fn receive(&self) -> Result<JsonRpcRequest>;
-    async fn send(&self, response: JsonRpcResponse) -> Result<()>;
-    async fn open(&self) -> Result<()>;
-    async fn close(&self) -> Result<()>;
+pub trait Transport: Send + Sync + 'static {
+    async fn run(&self, server: &Server) -> Result<()>;
 }
 
-#[derive(Clone)]
-struct StdioTransport;
+struct NatsTransport {
+    client: Client,
+    subject: String,
+}
 
 #[async_trait]
-impl Transport for StdioTransport {
-    async fn receive(&self) -> Result<JsonRpcRequest> {
-        let mut line = String::new();
-        let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-        stdin.read_line(&mut line).await.context("Failed to read from stdin")?;
-        if line.is_empty() {
-            return Err(anyhow::anyhow!("EOF received"));
+impl Transport for NatsTransport {
+    async fn run(&self, server: &Server) -> Result<()> {
+        info!("Connecting to NATS on subject '{}'", self.subject);
+        let mut subscription = self.client.subscribe(self.subject.clone()).await?;
+        
+        while let Some(message) = subscription.next().await {
+            let request: JsonRpcRequest = serde_json::from_slice(&message.payload)
+                .context("Failed to parse JSON-RPC request from NATS")?;
+            let response = server.handle_request(request).await;
+            let serialized = serde_json::to_vec(&response)?;
+            if let Some(reply) = message.reply {
+                self.client.publish(reply, serialized.into()).await?;
+            }
         }
-        serde_json::from_str(&line).context("Failed to parse JSON-RPC request")
-    }
-
-    async fn send(&self, response: JsonRpcResponse) -> Result<()> {
-        let serialized = serde_json::to_string(&response)?;
-        let mut stdout = tokio::io::stdout();
-        stdout.write_all(serialized.as_bytes()).await?;
-        stdout.write_all(b"\n").await?;
-        stdout.flush().await?;
         Ok(())
     }
+}
 
-    async fn open(&self) -> Result<()> { Ok(()) }
-    async fn close(&self) -> Result<()> { Ok(()) }
+impl NatsTransport {
+    async fn new(nats_url: &str, subject: &str) -> Result<Self> {
+        let client = async_nats::connect_with_options(
+            nats_url,
+            ConnectOptions::new().retry_on_initial_connect(),
+        ).await.context("Failed to connect to NATS")?;
+        Ok(NatsTransport {
+            client,
+            subject: subject.to_string(),
+        })
+    }
 }
 
 // --- Tools ---
@@ -159,20 +304,19 @@ impl Tools {
     }
 }
 
-// --- Server ---
-pub struct Server<T: Transport> {
-    transport: T,
+// --- ServerBuilder ---
+pub struct ServerBuilder {
+    transport: Option<Box<dyn Transport>>,
     tools: Tools,
     server_name: String,
     server_version: String,
     capabilities: ServerCapabilities,
-    runtime: tokio::runtime::Runtime,
 }
 
-impl<T: Transport> Server<T> {
-    pub fn builder(transport: T) -> ServerBuilder<T> {
-        ServerBuilder {
-            transport,
+impl ServerBuilder {
+    pub fn new() -> Self {
+        Self {
+            transport: None,
             tools: Tools::default(),
             server_name: "mcp-server".to_string(),
             server_version: "0.1.0".to_string(),
@@ -186,145 +330,11 @@ impl<T: Transport> Server<T> {
         }
     }
 
-    pub async fn run(&self) -> Result<()> {
-        self.transport.open().await?;
-        info!("Server '{}' (v{}) listening on stdio...", self.server_name, self.server_version);
-        loop {
-            match self.transport.receive().await {
-                Ok(request) => {
-                    let response = self.handle_request(request).await;
-                    self.transport.send(response).await?;
-                }
-                Err(e) if e.to_string().contains("EOF") => {
-                    info!("Received EOF, shutting down server...");
-                    break;
-                }
-                Err(e) => return Err(e.context("Failed to receive request")),
-            }
-        }
-        self.transport.close().await?;
-        info!("Server shut down gracefully.");
-        Ok(())
+    pub fn transport(mut self, transport: impl Transport + 'static) -> Self {
+        self.transport = Some(Box::new(transport));
+        self
     }
 
-    async fn handle_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
-        let id = req.id.clone();
-        let method = req.method.as_str();
-        let params = req.params.unwrap_or(json!({}));
-
-        let result = match method {
-            "initialize" => self.handle_initialize(params).await,
-            "listTools" => self.handle_list_tools(params).await,
-            "callTool" => self.handle_call_tool(params).await,
-            "listResources" => self.handle_list_resources(params).await,
-            "readResource" => self.handle_read_resource(params).await,
-            "listPrompts" => self.handle_list_prompts(params).await,
-            "getPrompt" => self.handle_get_prompt(params).await,
-            _ => Err(anyhow::anyhow!("Method not found: {}", method)),
-        };
-
-        match result {
-            Ok(value) => JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id,
-                result: Some(value),
-                error: None,
-            },
-            Err(e) => {
-                error!("Error handling {}: {:?}", method, e);
-                JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32601, // Method not found or generic error
-                        message: e.to_string(),
-                        data: None,
-                    }),
-                }
-            }
-        }
-    }
-
-    async fn handle_initialize(&self, params: Value) -> Result<Value> {
-        let client_info = params.get("clientInfo").and_then(|v| v.as_object());
-        info!("Initializing with client: {:?}", client_info);
-        Ok(json!({
-            "server_name": self.server_name,
-            "server_version": self.server_version,
-            "capabilities": self.capabilities,
-        }))
-    }
-
-    async fn handle_list_tools(&self, _params: Value) -> Result<Value> {
-        Ok(json!({
-            "tools": self.tools.list()
-        }))
-    }
-
-    async fn handle_call_tool(&self, params: Value) -> Result<Value> {
-        let name = params.get("name").and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'name' in params"))?;
-        let arguments = params.get("arguments");
-        let content = self.tools.call(name, arguments.cloned()).await?;
-        Ok(json!({
-            "content": content
-        }))
-    }
-
-    async fn handle_list_resources(&self, _params: Value) -> Result<Value> {
-        // Placeholder; implement resource storage as needed
-        Ok(json!({
-            "resources": [],
-            "next_cursor": null,
-            "meta": null
-        }))
-    }
-
-    async fn handle_read_resource(&self, params: Value) -> Result<Value> {
-        let uri = params.get("uri").and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'uri' in params"))?;
-        // Placeholder; implement resource reading
-        Ok(json!(format!("Resource content for {}", uri)))
-    }
-
-    async fn handle_list_prompts(&self, _params: Value) -> Result<Value> {
-        // Placeholder; implement prompt storage
-        Ok(json!({
-            "prompts": []
-        }))
-    }
-
-    async fn handle_get_prompt(&self, params: Value) -> Result<Value> {
-        let name = params.get("name").and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'name' in params"))?;
-        let arguments = params.get("arguments")
-            .ok_or_else(|| anyhow::anyhow!("Missing 'arguments' in params"))?;
-        // Placeholder; implement prompt logic
-        Ok(json!({
-            "description": format!("Prompt '{}'", name),
-            "messages": [
-                {
-                    "role": "user",
-                    "content": {
-                        "type": "text",
-                        "text": format!("Prompt with args: {:?}", arguments)
-                    }
-                }
-            ]
-        }))
-    }
-}
-
-pub struct ServerBuilder<T: Transport> {
-    transport: T,
-    tools: Tools,
-    server_name: String,
-    server_version: String,
-    capabilities: ServerCapabilities,
-}
-
-impl<T: Transport> ServerBuilder<T> {
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.server_name = name.into();
         self
@@ -345,14 +355,15 @@ impl<T: Transport> ServerBuilder<T> {
         self
     }
 
-    pub fn build(self) -> Result<Server<T>> {
+    pub fn build(self) -> Result<Server> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4) // Enough for stdio and async tools
+            .worker_threads(4)
             .enable_all()
             .build()
             .context("Failed to create Tokio runtime")?;
+        
         Ok(Server {
-            transport: self.transport,
+            transport: self.transport.ok_or_else(|| anyhow::anyhow!("Transport is required"))?,
             tools: self.tools,
             server_name: self.server_name,
             server_version: self.server_version,
@@ -384,12 +395,16 @@ impl Tool for ExampleTool {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::env_filter::EnvFilter::from_default_env())
+        .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let server = Server::builder(StdioTransport)
+    let transport = NatsTransport::new("nats://localhost:4222", "mcp.requests").await?;
+    
+    let server = ServerBuilder::new()
+        .transport(transport)
         .name("example-mcp")
         .version("0.1.0")
         .capabilities(ServerCapabilities {
@@ -402,6 +417,5 @@ fn main() -> Result<()> {
         .add_tool(ExampleTool)
         .build()?;
 
-    server.runtime.block_on(server.run())?;
-    Ok(())
+    server.run().await
 }
