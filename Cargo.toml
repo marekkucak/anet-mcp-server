@@ -1,15 +1,26 @@
 [package]
-name = "anet-mcp-server"
+name = "anet_mcp_server"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "SDK for creating Machine Conversation Protocol servers"
+authors = ["Marek Kucak marek.kucak@proton.me"]
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "anet_mcp_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "anet_mcp_server"
+path = "anet_mcp_server"
 
 [dependencies]
 anyhow = "1.0"
-async-nats = "0.32"  # Add this
+async-nats = "0.32"
 async-trait = "0.1"
-futures-util = "0.3" # Add this
+futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.0", features = ["full", "rt-multi-thread", "macros"] } # Make sure features include "macros"
+tokio = { version = "1.0", features = ["full", "rt-multi-thread", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

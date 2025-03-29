@@ -27,7 +27,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "anet-mcp-server"
+name = "anet_mcp_server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
