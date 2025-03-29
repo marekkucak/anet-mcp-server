@@ -245,12 +245,19 @@ impl Transport for NatsTransport {
         let mut subscription = self.client.subscribe(self.subject.clone()).await?;
         
         while let Some(message) = subscription.next().await {
+            info!("Received message on subject '{}': {:?}", self.subject, String::from_utf8_lossy(&message.payload));
             let request: JsonRpcRequest = serde_json::from_slice(&message.payload)
                 .context("Failed to parse JSON-RPC request from NATS")?;
+            
+            info!("Processing request: method={}, id={:?}", request.method, request.id);
             let response = server.handle_request(request).await;
             let serialized = serde_json::to_vec(&response)?;
+            
             if let Some(reply) = message.reply {
+                info!("Sending response to reply subject '{}': {:?}", reply, String::from_utf8_lossy(&serialized));
                 self.client.publish(reply, serialized.into()).await?;
+            } else {
+                info!("No reply subject provided, response not sent");
             }
         }
         Ok(())
