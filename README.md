@@ -2,6 +2,8 @@
 
 A Rust implementation of the **Model Control Protocol (MCP)** server that enables communication between clients and AI models via a standardized protocol.
 
+This project provides a scalable and asynchronous framework for building AI services using **Rust**, **Tokio**, and **NATS**. It is designed for developers building **AI agent systems**, **LLM-based tools**, or custom **JSON-RPC 2.0** service layers. The architecture supports real-time message passing, making it ideal for **microservices**, **AI orchestration**, and **tool-based model interaction**.
+
 ---
 
 ## Features
